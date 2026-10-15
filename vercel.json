@@ -1,0 +1,5 @@
+{
+  "redirects": [
+    { "source": "/(.*)", "destination": "https://script.google.com/macros/s/AKfycbxG2svkwrseH4tvZUJkXnll7SbU4wx5DwFflj53pxIJ7clqvtIyqgLwfSHNASVwo2VjUg/exec", "permanent": false }
+  ]
+}
