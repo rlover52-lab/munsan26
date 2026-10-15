@@ -25,8 +25,8 @@
   @keyframes p{0%,100%{opacity:.55}50%{opacity:1}}
   .err{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;text-align:center}
   .err button,.retry{font:inherit;font-weight:600;color:var(--accent);background:var(--accent-soft);border:0;border-radius:999px;padding:10px 18px;margin-top:10px}
-  #status{position:fixed;left:50%;bottom:calc(16px + env(safe-area-inset-bottom));transform:translateX(-50%);background:var(--ink);color:var(--bg);font-size:13px;padding:8px 14px;border-radius:999px;display:none;align-items:center;gap:8px;z-index:9;box-shadow:0 4px 16px rgba(0,0,0,.15)}
-  #status .spin{border-color:rgba(127,127,127,.4);border-top-color:var(--bg)}
+  #status{position:fixed;left:50%;top:calc(8px + env(safe-area-inset-top));transform:translateX(-50%);background:var(--card);color:var(--muted);border:1px solid var(--line);font-size:12px;padding:5px 12px;border-radius:999px;display:none;align-items:center;gap:6px;z-index:9;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+  #status .spin{width:12px;height:12px}
 </style>
 </head>
 <body>
@@ -39,12 +39,12 @@
     <div class="sk"><div class="bar w40"></div><div class="bar w90"></div></div>
   </div>
 </div>
-<div id="status"><span class="spin"></span><span id="statusText">최신 내용 확인 중</span></div>
+<div id="status"><span class="spin"></span><span id="statusText">새 소식 확인 중</span></div>
 <style id="pagecss"></style>
 <script>
 (function () {
   // ↓↓↓ 여기에 Apps Script 웹 앱 주소(…/exec)를 넣으세요 ↓↓↓
-  var API = "https://script.google.com/macros/s/AKfycbxG2svkwrseH4tvZUJkXnll7SbU4wx5DwFflj53pxIJ7clqvtIyqgLwfSHNASVwo2VjUg/exec";
+  var API = "여기에_웹앱_주소";
   // ↑↑↑ 따옴표는 지우지 마세요 ↑↑↑
 
   var KEY = "classpage-v1";
@@ -66,20 +66,26 @@
     status.style.display = on ? "flex" : "none";
   }
 
-  function load() {
+  function load(fresh) {
     if (loading) return;
     loading = true;
     var hasPage = !app.querySelector(".boot");
-    if (hasPage) setStatus("최신 내용 확인 중", true);
-    fetch(API + (API.indexOf("?") < 0 ? "?" : "&") + "format=json&t=" + Date.now())
-      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-      .then(function (parts) {
-        show(parts);
+    // 금방 끝나면 표시하지 않음. 새로고침 버튼을 누른 경우에만 바로 표시
+    var timer = setTimeout(function () { if (hasPage) setStatus("새 소식 확인 중", true); }, fresh ? 0 : 1200);
+    fetch(API + (API.indexOf("?") < 0 ? "?" : "&") + "format=json" + (fresh ? "&fresh=1" : "") + "&t=" + Date.now())
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); })
+      .then(function (text) {
+        var parts = JSON.parse(text);
+        var same = false;
+        try { same = localStorage.getItem(KEY) === text; } catch (e) {}
+        if (!same || !hasPage) show(parts); // 바뀐 게 없으면 화면을 다시 그리지 않음 (펼친 칸 유지)
         lastLoad = Date.now();
-        try { localStorage.setItem(KEY, JSON.stringify(parts)); } catch (e) {}
+        try { localStorage.setItem(KEY, text); } catch (e) {}
+        clearTimeout(timer);
         setStatus("", false);
       })
       .catch(function () {
+        clearTimeout(timer);
         if (hasPage) {
           setStatus("연결이 불안정해요. 저장된 내용을 보여 주고 있어요", true);
           setTimeout(function () { setStatus("", false); }, 3500);
@@ -98,7 +104,7 @@
     if (!t) return;
     e.preventDefault();
     if (t.classList.contains("retry")) app.innerHTML = BOOT;
-    load();
+    load(true);
   });
 
   // 홈 화면 앱을 다시 열었을 때 2분이 지났으면 자동으로 최신 내용 확인
@@ -110,7 +116,7 @@
   if ("serviceWorker" in navigator) {
     try { navigator.serviceWorker.register("/sw.js"); } catch (e) {}
   }
-  
+
   // 저장해 둔 내용이 있으면 바로 보여 주고, 뒤에서 최신 내용을 받아 옴
   try {
     var cached = localStorage.getItem(KEY);
