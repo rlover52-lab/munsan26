@@ -105,7 +105,9 @@
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState === "visible" && Date.now() - lastLoad > 2 * 60 * 1000) load();
   });
-
+  if ("serviceWorker" in navigator) {
+    try { navigator.serviceWorker.register("/sw.js"); } catch (e) {}
+  }
   // 저장해 둔 내용이 있으면 바로 보여 주고, 뒤에서 최신 내용을 받아 옴
   try {
     var cached = localStorage.getItem(KEY);
