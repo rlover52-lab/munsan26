@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="2학년 6반">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -44,7 +45,7 @@
 <script>
 (function () {
   // ↓↓↓ 여기에 Apps Script 웹 앱 주소(…/exec)를 넣으세요 ↓↓↓
-  var API = "https://script.google.com/macros/s/AKfycbxG2svkwrseH4tvZUJkXnll7SbU4wx5DwFflj53pxIJ7clqvtIyqgLwfSHNASVwo2VjUg/exec";
+  var API = "여기에_웹앱_주소";
   // ↑↑↑ 따옴표는 지우지 마세요 ↑↑↑
 
   var KEY = "classpage-v1";
@@ -54,12 +55,52 @@
   var statusText = document.getElementById("statusText");
   var loading = false, lastLoad = 0;
 
-  function show(parts) {
+  // ---- 보던 상태 기억하기: 스크롤 위치, 펼친 칸, 이름 찾기 글자 ----
+  var STATE_KEY = "classpage-state";
+  function captureState() {
+    var st = { y: window.scrollY, open: [], clean: false, q: "", at: Date.now() };
+    var ds = app.querySelectorAll("details");
+    for (var i = 0; i < ds.length; i++) if (ds[i].open) st.open.push(i);
+    var cb = document.getElementById("cleanBtn");
+    st.clean = !!(cb && cb.getAttribute("aria-expanded") === "true");
+    var q = document.getElementById("q");
+    st.q = q ? q.value : "";
+    return st;
+  }
+  function saveState() {
+    if (app.querySelector(".boot")) return;
+    try { localStorage.setItem(STATE_KEY, JSON.stringify(captureState())); } catch (e) {}
+  }
+  function applyState(st) {
+    if (!st) return;
+    var ds = app.querySelectorAll("details");
+    (st.open || []).forEach(function (i) { if (ds[i]) ds[i].open = true; });
+    if (st.clean) { var cb = document.getElementById("cleanBtn"); if (cb && cb.getAttribute("aria-expanded") !== "true") cb.click(); }
+    if (st.q) { var q = document.getElementById("q"); if (q) { q.value = st.q; q.dispatchEvent(new Event("input")); } }
+    if (st.y) window.scrollTo(0, st.y);
+  }
+  function savedState() {
+    try {
+      var st = JSON.parse(localStorage.getItem(STATE_KEY) || "null");
+      return st && Date.now() - st.at < 30 * 60 * 1000 ? st : null; // 30분 안에 보던 것만 되살림
+    } catch (e) { return null; }
+  }
+
+  function show(parts, st) {
     document.getElementById("pagecss").textContent = parts.css || "";
     app.innerHTML = parts.body || "";
     if (parts.title) document.title = parts.title;
     try { if (parts.js) new Function(parts.js)(); } catch (e) { /* 화면은 그대로 둠 */ }
+    applyState(st);
   }
+
+  var saveTimer = null;
+  function saveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(saveState, 300); }
+  window.addEventListener("scroll", saveSoon, { passive: true });
+  document.addEventListener("toggle", saveSoon, true);
+  document.addEventListener("input", saveSoon, true);
+  document.addEventListener("click", saveSoon, true);
+  window.addEventListener("pagehide", saveState);
 
   function setStatus(text, on) {
     statusText.textContent = text;
@@ -78,7 +119,8 @@
         var parts = JSON.parse(text);
         var same = false;
         try { same = localStorage.getItem(KEY) === text; } catch (e) {}
-        if (!same || !hasPage) show(parts); // 바뀐 게 없으면 화면을 다시 그리지 않음 (펼친 칸 유지)
+        // 바뀐 게 없으면 다시 그리지 않음. 바뀌었으면 보던 상태 그대로 새 내용으로 교체
+        if (!same || !hasPage) show(parts, hasPage ? captureState() : savedState());
         lastLoad = Date.now();
         try { localStorage.setItem(KEY, text); } catch (e) {}
         clearTimeout(timer);
@@ -120,7 +162,7 @@
   // 저장해 둔 내용이 있으면 바로 보여 주고, 뒤에서 최신 내용을 받아 옴
   try {
     var cached = localStorage.getItem(KEY);
-    if (cached) show(JSON.parse(cached));
+    if (cached) show(JSON.parse(cached), savedState());
   } catch (e) {}
   load();
 })();
