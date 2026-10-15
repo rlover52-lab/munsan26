@@ -114,26 +114,34 @@
     // 금방 끝나면 표시하지 않음. 새로고침 버튼을 누른 경우에만 바로 표시
     var timer = setTimeout(function () { if (hasPage) setStatus("새 소식 확인 중", true); }, fresh ? 0 : 1200);
     fetch(API + (API.indexOf("?") < 0 ? "?" : "&") + "format=json" + (fresh ? "&fresh=1" : "") + "&t=" + Date.now())
-      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); })
+      .catch(function () { throw new Error("NET"); })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP" + r.status); return r.text(); })
       .then(function (text) {
-        var parts = JSON.parse(text);
+        var parts;
+        try { parts = JSON.parse(text); } catch (e) { throw new Error(/<html|<!doctype/i.test(text) ? "GOOGLE" : "JSON"); }
+        if (!parts || !parts.body) throw new Error("EMPTY");
         var same = false;
         try { same = localStorage.getItem(KEY) === text; } catch (e) {}
         // 바뀐 게 없으면 다시 그리지 않음. 바뀌었으면 보던 상태 그대로 새 내용으로 교체
-        if (!same || !hasPage) show(parts, hasPage ? captureState() : savedState());
+        if (!same || !hasPage) {
+          try { show(parts, hasPage ? captureState() : savedState()); }
+          catch (e) { show(parts, null); } // 상태 되살리기가 실패해도 새 내용은 보여 줌
+        }
         lastLoad = Date.now();
         try { localStorage.setItem(KEY, text); } catch (e) {}
         clearTimeout(timer);
         setStatus("", false);
       })
-      .catch(function () {
+      .catch(function (err) {
         clearTimeout(timer);
+        var code = (err && err.message) || "?";
+        var why = code === "NET" ? "인터넷 연결 문제" : code === "GOOGLE" ? "구글 스크립트 오류" : "응답 오류 " + code;
         if (hasPage) {
-          setStatus("연결이 불안정해요. 저장된 내용을 보여 주고 있어요", true);
-          setTimeout(function () { setStatus("", false); }, 3500);
+          setStatus("새 소식을 못 받았어요 (" + why + "). 저장된 내용이에요", true);
+          setTimeout(function () { setStatus("", false); }, 5000);
         } else {
           app.innerHTML = '<div class="boot"><h1>2학년 6반</h1><div class="err">' +
-            '<p>학급 소식을 불러오지 못했어요.<br>인터넷 연결을 확인하고 다시 시도해 주세요.</p>' +
+            '<p>학급 소식을 불러오지 못했어요.<br>(' + why + ')</p>' +
             '<button type="button" class="retry">다시 시도</button></div></div>';
         }
       })
