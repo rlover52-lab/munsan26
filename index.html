@@ -127,8 +127,13 @@
     });
   }
 
+  var pendingFresh = false;
+  function shownBuiltAt() {
+    try { var c = JSON.parse(localStorage.getItem(KEY) || "null"); return (c && c.builtAt) || 0; } catch (e) { return 0; }
+  }
+
   function load(fresh) {
-    if (loading) return;
+    if (loading) { if (fresh) pendingFresh = true; return; } // 확인 중에 새로고침을 누르면 끝난 뒤 바로 한 번 더
     loading = true;
     var hasPage = !app.querySelector(".boot");
     // 금방 끝나면 표시하지 않음. 새로고침 버튼을 누른 경우에만 바로 표시
@@ -136,6 +141,11 @@
     jsonp(API + (API.indexOf("?") < 0 ? "?" : "&") + "format=json" + (fresh ? "&fresh=1" : "") + "&t=" + Date.now(), 25000)
       .then(function (parts) {
         if (!parts || !parts.body) throw new Error("EMPTY");
+        // 지금 보고 있는 것보다 오래된 내용이 늦게 도착하면 무시
+        if (hasPage && parts.builtAt && parts.builtAt < shownBuiltAt()) {
+          clearTimeout(timer); setStatus("", false); lastLoad = Date.now();
+          return;
+        }
         var text = JSON.stringify(parts);
         var same = false;
         try { same = localStorage.getItem(KEY) === text; } catch (e) {}
@@ -162,7 +172,10 @@
             '<button type="button" class="retry">다시 시도</button></div></div>';
         }
       })
-      .then(function () { loading = false; });
+      .then(function () {
+        loading = false;
+        if (pendingFresh) { pendingFresh = false; load(true); }
+      });
   }
 
   // 새로고침 버튼: 페이지 이동 없이 내용만 다시 불러옴
