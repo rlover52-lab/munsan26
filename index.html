@@ -107,19 +107,36 @@
     status.style.display = on ? "flex" : "none";
   }
 
+  // 구글에서 내용을 '스크립트 파일처럼' 불러옴 (다른 사이트 간 데이터 요청 제한을 받지 않음)
+  var seq = 0;
+  function jsonp(url, ms) {
+    return new Promise(function (resolve, reject) {
+      var name = "__classpage_cb" + (++seq) + "_" + Date.now();
+      var s = document.createElement("script");
+      var done = false;
+      function cleanup() {
+        done = true; clearTimeout(t);
+        try { delete window[name]; } catch (e) { window[name] = undefined; }
+        if (s.parentNode) s.parentNode.removeChild(s);
+      }
+      var t = setTimeout(function () { if (!done) { cleanup(); reject(new Error("TIMEOUT")); } }, ms);
+      window[name] = function (data) { if (!done) { cleanup(); resolve(data); } };
+      s.onerror = function () { if (!done) { cleanup(); reject(new Error("NET")); } };
+      s.src = url + "&callback=" + name;
+      document.head.appendChild(s);
+    });
+  }
+
   function load(fresh) {
     if (loading) return;
     loading = true;
     var hasPage = !app.querySelector(".boot");
     // 금방 끝나면 표시하지 않음. 새로고침 버튼을 누른 경우에만 바로 표시
     var timer = setTimeout(function () { if (hasPage) setStatus("새 소식 확인 중", true); }, fresh ? 0 : 1200);
-    fetch(API + (API.indexOf("?") < 0 ? "?" : "&") + "format=json" + (fresh ? "&fresh=1" : "") + "&t=" + Date.now())
-      .catch(function () { throw new Error("NET"); })
-      .then(function (r) { if (!r.ok) throw new Error("HTTP" + r.status); return r.text(); })
-      .then(function (text) {
-        var parts;
-        try { parts = JSON.parse(text); } catch (e) { throw new Error(/<html|<!doctype/i.test(text) ? "GOOGLE" : "JSON"); }
+    jsonp(API + (API.indexOf("?") < 0 ? "?" : "&") + "format=json" + (fresh ? "&fresh=1" : "") + "&t=" + Date.now(), 25000)
+      .then(function (parts) {
         if (!parts || !parts.body) throw new Error("EMPTY");
+        var text = JSON.stringify(parts);
         var same = false;
         try { same = localStorage.getItem(KEY) === text; } catch (e) {}
         // 바뀐 게 없으면 다시 그리지 않음. 바뀌었으면 보던 상태 그대로 새 내용으로 교체
@@ -135,7 +152,7 @@
       .catch(function (err) {
         clearTimeout(timer);
         var code = (err && err.message) || "?";
-        var why = code === "NET" ? "인터넷 연결 문제" : code === "GOOGLE" ? "구글 스크립트 오류" : "응답 오류 " + code;
+        var why = code === "NET" ? "인터넷 연결 문제" : code === "TIMEOUT" ? "응답이 너무 늦음" : "응답 오류 " + code;
         if (hasPage) {
           setStatus("새 소식을 못 받았어요 (" + why + "). 저장된 내용이에요", true);
           setTimeout(function () { setStatus("", false); }, 5000);
