@@ -1,0 +1,1434 @@
+/****************************************************
+ * 리마인더 봇 (텔레그램 + 구글 시트)
+ * - 시트의 '리마인더' 탭을 읽어 때가 되면 텔레그램으로 알림
+ * - 매일 아침 오늘/다가오는 일 요약
+ * - 텔레그램에서 바로 등록·조회·완료 처리
+ *
+ * 처음 한 번:
+ *  1) 프로젝트 설정 > 스크립트 속성에 BOT_TOKEN 추가
+ *  2) 이 파일에서 setup 함수 실행 (권한 허용)
+ *  3) 텔레그램에서 봇에게 /start 보내기
+ ****************************************************/
+
+const TZ = 'Asia/Seoul';
+const SHEET_NAME = '리마인더';
+const SETTINGS_NAME = '설정';
+const COL = { ID: 0, DATE: 1, TIME: 2, TEXT: 3, ADVANCE: 4, REPEAT: 5, STATUS: 6, SOURCE: 7, MEMO: 8, SENT: 9 };
+const NCOL = 10;
+const LATE_LIMIT_MIN = 60;      // 이보다 늦어진 알림은 보내지 않고 넘김
+const WEEK = '월화수목금토일';
+
+const HELP = [
+  '📌 사용법',
+  '',
+  '그냥 문장으로 보내면 등록돼요.',
+  '• 내일 15:00 학년협의회',
+  '• 10/20 수행평가 채점 마감 1일 전',
+  '• 다음주 화요일 3시 학부모 상담 30분 전',
+  '• 매주 목요일 8시 실험 준비물 확인',
+  '',
+  '날짜: 오늘, 내일, 모레, 3일 후, 10/20, 10월 20일, 금요일, 다음주 월요일',
+  '시각: 15:00, 3시, 3시 반, 오전 9시 (오전/오후 없이 1~6시는 오후로 봐요)',
+  '미리 알림: 30분 전, 2시간 전, 1일 전, 1주 전',
+  '반복: 매일, 평일, 매주, 매월, 매년',
+  '',
+  '📢 종례 전달사항: 문장에 "종례"를 넣으면 종례 직전에 한 번에 모아서 보내요.',
+  '• 종례 때 가정통신문 회수',
+  '• 금요일 종례 때 다음 주 수행평가 공지',
+  '• 매주 금요일 종례 때 청소 구역 확인',
+  '🌅 조회 전달사항: "조회"를 넣으면 조회 직전에 모아서 보내요. 예: 내일 조회 때 가정통신문 배부',
+  '',
+  '/today 오늘 일정',
+  '/list 다가오는 일정',
+  '/jr 오늘 종례 전달사항 (/jr 내일 도 가능)',
+  '/prep 다음 수업일 준비할 것 (/prep 10/27 처럼 날짜 지정 가능)',
+  '/club 10/23  동아리 날 추가 (그날은 동아리 종례 시각 사용), /club 만 보내면 목록',
+  '',
+  '📱 학급 페이지',
+  '• 사진을 보내면 학급 페이지 안내에 올라가요. 사진 설명에 제목을 쓰고, "~10/30" 처럼 쓰면 그날까지 게시 (기본 2주)',
+  '• 맨 앞에 [수행평가] 또는 [행사]를 붙이면 그 칸에 들어가요. 없으면 수행·평가·과제 같은 말이 있으면 수행평가, 아니면 행사',
+  '• /notice 제목 | 내용 ~10/30  글로만 된 안내 올리기',
+  '• /notices 게시 중인 안내 목록, /hide 번호 안내 내리기',
+  '• /page 학급 페이지 주소',
+  '• 종례 전달사항에 "비공개"를 넣으면 페이지에는 안 나와요',
+  '/done 번호  완료 처리 (반복 일정은 이번 회차만, "/done 번호 전체"는 반복 종료)',
+  '/help 이 안내'
+].join('\n');
+
+/* ================= 설정 ================= */
+
+function setup() {
+  const props = PropertiesService.getScriptProperties();
+  if (!props.getProperty('BOT_TOKEN')) {
+    throw new Error('프로젝트 설정 > 스크립트 속성에 BOT_TOKEN을 먼저 넣어 주세요.');
+  }
+  const me = tg_('getMe', {});
+  if (!me || !me.ok) throw new Error('토큰이 맞지 않는 것 같아요: ' + JSON.stringify(me));
+  tg_('deleteWebhook', {});
+  tg_('setMyCommands', {
+    commands: [
+      { command: 'today', description: '오늘 일정' },
+      { command: 'list', description: '다가오는 일정' },
+      { command: 'jr', description: '종례 전달사항' },
+      { command: 'prep', description: '다음 수업일 준비 (예: /prep 10/27)' },
+      { command: 'club', description: '동아리 날 추가/확인 (예: /club 10/23)' },
+      { command: 'notice', description: '학급 페이지 안내 올리기 (예: /notice 제목 | 내용)' },
+      { command: 'notices', description: '게시 중인 안내' },
+      { command: 'hide', description: '안내 내리기 (예: /hide 2)' },
+      { command: 'page', description: '학급 페이지 주소' },
+      { command: 'done', description: '완료 처리 (예: /done 3)' },
+      { command: 'help', description: '사용법' }
+    ]
+  });
+  photoFolder_(); // 사진 저장 폴더 (드라이브 권한도 이때 허용)
+  MailApp.getRemainingDailyQuota(); // 텔레그램 장애 시 메일 알림용 권한도 이때 허용
+  ScriptApp.getProjectTriggers().forEach(function (t) { ScriptApp.deleteTrigger(t); });
+  ScriptApp.newTrigger('pollTelegram').timeBased().everyMinutes(1).create();
+  ScriptApp.newTrigger('checkReminders').timeBased().everyMinutes(5).create();
+  Logger.log('설정 완료. 봇 이름: @' + me.result.username + ' → 텔레그램에서 /start 를 보내세요.');
+}
+
+/** 연결 확인용: 텔레그램으로 테스트 메시지 보내기 */
+function testSend() {
+  send_('✅ 리마인더 봇 연결 확인 메시지예요.');
+}
+
+/** 봇을 멈추고 싶을 때 */
+function stopBot() {
+  ScriptApp.getProjectTriggers().forEach(function (t) { ScriptApp.deleteTrigger(t); });
+  Logger.log('트리거를 모두 지웠어요. 다시 켜려면 setup 실행.');
+}
+
+/* ================= 텔레그램 메시지 받기 ================= */
+
+function pollTelegram() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return;
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const offset = Number(props.getProperty('UPDATE_OFFSET') || 0);
+    let res = null;
+    try { res = tg_('getUpdates', { offset: offset, timeout: 0, allowed_updates: ['message'] }); }
+    catch (e) { console.warn('getUpdates 실패: ' + e.message); return; } // 다음 1분 뒤 다시 시도
+    if (!res || !res.ok) return;
+    res.result.forEach(function (u) {
+      props.setProperty('UPDATE_OFFSET', String(u.update_id + 1));
+      if (u.message) {
+        try { handleMessage_(u.message); }
+        catch (e) { try { safeSend_(String(u.message.chat.id), '⚠️ 처리 중 오류가 났어요: ' + e.message); } catch (e2) {} }
+      }
+    });
+    if (res.result.length) refreshPageCache_(); // 봇으로 올린 안내·종례가 페이지에 바로 반영되게
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function handleMessage_(msg) {
+  const props = PropertiesService.getScriptProperties();
+  const chatId = String(msg.chat.id);
+  const owner = props.getProperty('CHAT_ID');
+  const text = String(msg.text || msg.caption || '').trim();
+
+  if (!owner) {
+    if (/^\/start/.test(text)) {
+      props.setProperty('CHAT_ID', chatId);
+      send_('등록됐어요. 이제 이 대화로 알림을 보내 드릴게요.\n\n' + HELP);
+    }
+    return;
+  }
+  if (chatId !== owner) return; // 다른 사람이 보낸 메시지는 무시
+
+  // 사진 → 학급 페이지 안내
+  const isImageDoc = msg.document && /^image\//.test(msg.document.mime_type || '');
+  if (msg.photo || isImageDoc) {
+    const fileId = msg.photo ? msg.photo[msg.photo.length - 1].file_id : msg.document.file_id;
+    handlePhoto_(fileId, text);
+    return;
+  }
+  if (!text) return;
+
+  const m = text.match(/^\/(\S+)\s*([\s\S]*)$/);
+  const cmd = m ? m[1].replace(/@.*/, '').toLowerCase() : '';
+  const arg = m ? m[2].trim() : text;
+
+  switch (cmd) {
+    case 'start': case 'help': case '도움': case '도움말':
+      send_(HELP); return;
+    case 'today': case '오늘':
+      send_(listText_(0, '📋 오늘 일정')); return;
+    case 'list': case '목록':
+      send_(listText_(Number(getSetting_('목록 기간(일)')) || 14, '📅 다가오는 일정')); return;
+    case 'done': case '완료':
+      markDone_(arg); return;
+    case 'jr': case '종례':
+      send_(jongryeText_(/내일/.test(arg) ? nextSchoolDay_(today_(), false) : today_(), true)); return;
+    case 'club': case '동아리':
+      clubCommand_(arg); return;
+    case 'prep': case '수업': case '준비':
+      prepCommand_(arg); return;
+    case 'notice': case '안내':
+      addTextNotice_(arg); return;
+    case 'notices': case '안내목록':
+      send_(noticeListText_()); return;
+    case 'hide': case '내리기':
+      hideNotice_(arg); return;
+    case 'page': case '페이지':
+      send_('📱 학급 페이지\n' + (ScriptApp.getService().getUrl() || '아직 웹 앱으로 배포되지 않았어요.')); return;
+    case 'add': case '추가': case '':
+      addFromText_(arg); return;
+    default:
+      send_('모르는 명령이에요.\n\n' + HELP);
+  }
+}
+
+/* ================= 알림 확인 (5분마다) ================= */
+
+function checkReminders() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+  try {
+    const props = PropertiesService.getScriptProperties();
+    if (!props.getProperty('CHAT_ID')) return;
+
+    const sh = sheet_();
+    const now = new Date();
+    const last = sh.getLastRow();
+    const summaryMode = summaryMode_();
+    const baseNoTime = normTime_(getSetting_('시각 없는 일정 알림 기준 시각')) || '08:00';
+
+    // 종례 전달사항 묶음 (행 정리보다 먼저)
+    checkJohoe_(now, props);
+    checkJongrye_(now, props);
+
+    if (last >= 2) {
+      const vals = sh.getRange(2, 1, last - 1, NCOL).getDisplayValues();
+      vals.forEach(function (r, i) {
+        if (String(r[COL.STATUS]).trim() !== '예정') return;
+        const date = normDate_(r[COL.DATE]);
+        if (!date) return;
+        const rawTime = r[COL.TIME];
+        const isJ = isJongrye_(rawTime);
+        const time = timeFor_(date, rawTime);
+        const sent = String(r[COL.SENT] || '').split(',').map(function (s) { return s.trim(); }).filter(String);
+        const base = at_(date, time || baseNoTime);
+
+        let offs = offsets_(r[COL.ADVANCE]);
+        if (!isJ && (time || summaryMode === '끔')) offs.push(0);
+        if (isJ) offs = offs.filter(function (o) { return o > 0; });
+        offs = offs.filter(function (v, k, a) { return a.indexOf(v) === k; }).sort(function (a, b) { return b - a; });
+
+        let changed = false;
+        offs.forEach(function (o) {
+          const key = date + '@' + o;
+          if (sent.indexOf(key) >= 0) return;
+          const t = new Date(base.getTime() - o * 60000);
+          if (t <= now) {
+            if (now - t <= LATE_LIMIT_MIN * 60000) send_(alertText_(r, date, time, o));
+            sent.push(key);
+            changed = true;
+          }
+        });
+
+        const rowNo = i + 2;
+        const end = time ? base : at_(addDays_(date, 1), '00:00');
+        if (now >= end) {
+          const rep = String(r[COL.REPEAT] || '').trim();
+          if (rep && rep !== '없음') {
+            let next = nextDate_(date, rep);
+            while (next && endOf_(next, timeFor_(next, rawTime)) <= now) next = nextDate_(next, rep);
+            if (next) {
+              sh.getRange(rowNo, COL.DATE + 1).setValue(next);
+              sh.getRange(rowNo, COL.SENT + 1).setValue('');
+              return;
+            }
+          }
+          sh.getRange(rowNo, COL.STATUS + 1).setValue('지남');
+          sh.getRange(rowNo, COL.SENT + 1).setValue(sent.join(','));
+          return;
+        }
+        if (changed) sh.getRange(rowNo, COL.SENT + 1).setValue(sent.join(','));
+      });
+    }
+
+    // 아침 요약
+    if (summaryMode !== '끔') {
+      const td = today_();
+      const st = at_(td, normTime_(getSetting_('아침 요약 시각')) || '07:30');
+      const weekdayOk = summaryMode !== '평일' || dow_(td) <= 5;
+      if (weekdayOk && props.getProperty('LAST_SUMMARY') !== td && now >= st && now - st < 3 * 3600000) {
+        props.setProperty('LAST_SUMMARY', td);
+        send_(summaryText_());
+      }
+    }
+
+    // 퇴근 시각: 다음 수업일 준비 알림
+    try { checkPrep_(now, props); }
+    catch (e) {
+      // 텔레그램 연결 문제는 5분 뒤 자동으로 다시 시도하므로 따로 알리지 않음
+      if (!/텔레그램 연결 실패/.test(e.message)) { try { send_('⚠️ 수업 준비 알림 오류: ' + e.message); } catch (e2) {} }
+      console.warn('checkPrep_ 실패: ' + e.message);
+    }
+
+    // 학급 페이지 미리 만들어 두기 (열 때 빨리 뜨도록)
+    refreshPageCache_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function endOf_(date, time) {
+  return time ? at_(date, time) : at_(addDays_(date, 1), '00:00');
+}
+
+/* ================= 종례 ================= */
+
+/** 시각 칸이 '종례'나 '조회'면 그 이름, 아니면 '' */
+function slotOf_(rawTime) {
+  const s = String(rawTime || '').trim();
+  return s === '종례' || s === '조회' ? s : '';
+}
+function isJongrye_(rawTime) { return !!slotOf_(rawTime); } // 종례·조회처럼 묶어서 보내는 항목
+
+/** 시각 칸이 '종례'/'조회'면 그날 그 시각, 아니면 적힌 시각 */
+function timeFor_(date, rawTime) {
+  const slot = slotOf_(rawTime);
+  if (slot === '조회') return johoeTime_(date);
+  if (slot === '종례') return jongryeTime_(date);
+  return normTime_(rawTime);
+}
+
+/* ================= 조회 ================= */
+
+/** 그날 조회 시각 (주말이면 '') */
+function johoeTime_(date) {
+  if (dow_(date) > 5) return '';
+  return normTime_(getSetting_('조회 시각')) || '08:50';
+}
+
+function johoeItems_(date) {
+  return items_(date, date).filter(function (it) { return it.time === '조회'; });
+}
+
+function johoeText_(date) {
+  const list = johoeItems_(date);
+  if (!list.length) return '';
+  return '🌅 ' + fmtDay_(date) + ' 조회 (' + johoeTime_(date) + ')\n\n' +
+    list.map(function (it, k) { return (k + 1) + '. ' + it.text + (/비공개/.test(it.memo) ? ' 🔒' : '') + '  #' + it.id; }).join('\n');
+}
+
+function checkJohoe_(now, props) {
+  const td = today_();
+  const jt = johoeTime_(td);
+  if (!jt || props.getProperty('LAST_JOHOE') === td) return;
+  const leadRaw = getSetting_('조회 알림 (몇 분 전)');
+  const lead = leadRaw === '' || isNaN(Number(leadRaw)) ? 10 : Number(leadRaw);
+  const jAt = at_(td, jt);
+  if (now < new Date(jAt.getTime() - lead * 60000) || now - jAt > 60 * 60000) return;
+  props.setProperty('LAST_JOHOE', td);
+  const text = johoeText_(td);
+  if (text) send_(text);
+}
+
+/** 그날 종례 시각 (주말 등 종례가 없으면 '') */
+function jongryeTime_(date) {
+  if (clubDates_().indexOf(date) >= 0) {
+    const ct = normTime_(getSetting_('동아리 날 종례 시각'));
+    if (ct) return ct;
+  }
+  const d = dow_(date);
+  if (d > 5) return '';
+  return normTime_(getSetting_('종례 시각(' + WEEK.charAt(d - 1) + ')'));
+}
+
+function clubDates_() {
+  const out = [];
+  const re = /(\d{4})\D+(\d{1,2})\D+(\d{1,2})/g;
+  const s = getSetting_('동아리 날짜');
+  let m;
+  while ((m = re.exec(s))) out.push(m[1] + '-' + pad_(m[2]) + '-' + pad_(m[3]));
+  return out;
+}
+
+/** date 다음(포함 여부 선택)으로 종례가 있는 날 */
+function nextSchoolDay_(date, includeSelf) {
+  let d = includeSelf ? date : addDays_(date, 1);
+  for (let k = 0; k < 14; k++) {
+    if (jongryeTime_(d)) return d;
+    d = addDays_(d, 1);
+  }
+  return d;
+}
+
+function jongryeText_(date, always) {
+  const jt = jongryeTime_(date);
+  const list = jongryeItems_(date);
+  const duty = dutyFor_(date);
+  const dutyLine = duty ? '🧹 청소: ' + duty.clean + '   🖍 칠판: ' + duty.board : '';
+  if (!list.length && !always && !dutyLine) return '';
+  const head = '📢 ' + fmtDay_(date) + ' 종례' + (jt ? ' (' + jt + ')' : '');
+  const body = list.length
+    ? list.map(function (it, k) { return (k + 1) + '. ' + it.text + (/비공개/.test(it.memo) ? ' 🔒' : '') + '  #' + it.id; }).join('\n')
+    : '전달사항 없음';
+  return head + (dutyLine ? '\n' + dutyLine : '') + '\n\n' + body;
+}
+
+function jongryeItems_(date) {
+  return items_(date, date).filter(function (it) { return it.time === '종례'; });
+}
+
+function checkJongrye_(now, props) {
+  const td = today_();
+  const jt = jongryeTime_(td);
+  if (!jt || props.getProperty('LAST_JONGRYE') === td) return;
+  const leadRaw = getSetting_('종례 알림 (몇 분 전)');
+  const lead = leadRaw === '' || isNaN(Number(leadRaw)) ? 10 : Number(leadRaw);
+  const jAt = at_(td, jt);
+  const sendAt = new Date(jAt.getTime() - lead * 60000);
+  if (now < sendAt || now - jAt > 60 * 60000) return;
+  props.setProperty('LAST_JONGRYE', td);
+  const always = getSetting_('전달사항 없는 날 알림') === '보냄';
+  const text = jongryeText_(td, always);
+  if (text) send_(text);
+}
+
+function clubCommand_(arg) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SETTINGS_NAME);
+  const vals = sh.getRange(1, 1, sh.getLastRow(), 1).getDisplayValues();
+  let row = 0;
+  for (let i = 0; i < vals.length; i++) if (String(vals[i][0]).trim() === '동아리 날짜') row = i + 1;
+  if (!row) { send_("설정 탭에 '동아리 날짜' 항목이 없어요."); return; }
+
+  const td = today_();
+  let list = clubDates_().filter(function (d) { return d >= td; });
+  if (arg) {
+    const p = parseNatural_(arg);
+    if (!p.date) { send_('날짜를 못 찾았어요. 예: /club 10/23'); return; }
+    if (list.indexOf(p.date) < 0) list.push(p.date);
+    list.sort();
+    sh.getRange(row, 2).setNumberFormat('@').setValue(list.join(', '));
+    send_('🎨 ' + fmtDay_(p.date) + ' 동아리 날로 등록했어요. 그날 종례는 ' + (normTime_(getSetting_('동아리 날 종례 시각')) || '') + '이에요.');
+    return;
+  }
+  send_(list.length ? '🎨 동아리 날\n' + list.map(fmtDay_).join('\n') : '등록된 동아리 날이 없어요. 예: /club 10/23');
+}
+
+/* ================= 메시지 만들기 ================= */
+
+function alertText_(r, date, time, o) {
+  const when = fmtDay_(date) + (time ? ' ' + time : '');
+  const memo = r[COL.MEMO] ? '\n📝 ' + r[COL.MEMO] : '';
+  if (o === 0) {
+    return (time ? '⏰ 지금 할 일' : '📌 오늘 할 일') + '\n' + r[COL.TEXT] + ' (' + when + ')' + memo + '\n[#' + r[COL.ID] + ']';
+  }
+  return '🔔 ' + offsetLabel_(o) + ' 남았어요\n' + r[COL.TEXT] + ' (' + when + ')' + memo + '\n[#' + r[COL.ID] + ']';
+}
+
+function summaryText_() {
+  const td = today_();
+  const days = Number(getSetting_('요약에 포함할 기간(일)')) || 7;
+  const today = items_(td, td);
+  const soon = items_(addDays_(td, 1), addDays_(td, days));
+  let s = '☀️ ' + fmtDay_(td) + ' 아침 브리핑\n\n[오늘]\n';
+  s += today.length ? today.map(lineText_).join('\n') : '등록된 일이 없어요.';
+  s += '\n\n[앞으로 ' + days + '일]\n';
+  s += soon.length ? soon.map(lineText_).join('\n') : '등록된 일이 없어요.';
+  return s;
+}
+
+function listText_(days, title) {
+  const td = today_();
+  const list = items_(td, addDays_(td, days));
+  if (!list.length) return title + '\n등록된 일이 없어요.';
+  return title + '\n' + list.map(lineText_).join('\n');
+}
+
+function lineText_(it) {
+  return '• ' + fmtDay_(it.date) + (it.time ? ' ' + it.time : '') + '  ' + it.text +
+    (it.repeat && it.repeat !== '없음' ? ' (' + it.repeat + ')' : '') + '  #' + it.id;
+}
+
+function items_(from, to) {
+  const sh = sheet_();
+  const last = sh.getLastRow();
+  if (last < 2) return [];
+  return sh.getRange(2, 1, last - 1, NCOL).getDisplayValues()
+    .filter(function (r) { return String(r[COL.STATUS]).trim() === '예정'; })
+    .map(function (r) {
+      return { id: r[COL.ID], date: normDate_(r[COL.DATE]), time: slotOf_(r[COL.TIME]) || normTime_(r[COL.TIME]), text: r[COL.TEXT], repeat: String(r[COL.REPEAT] || '').trim(), memo: String(r[COL.MEMO] || '') };
+    })
+    .filter(function (it) { return it.date && it.date >= from && it.date <= to; })
+    .sort(function (a, b) { return (a.date + (a.time || '00:00')).localeCompare(b.date + (b.time || '00:00')); });
+}
+
+/* ================= 등록 / 완료 ================= */
+
+function addFromText_(s) {
+  if (!s) { send_('추가할 내용을 같이 보내 주세요.\n예: 내일 15:00 학년협의회'); return; }
+  const p = parseNatural_(s);
+  if (!p.date) {
+    send_('날짜를 못 찾았어요. 이렇게 보내 주세요.\n• 내일 15:00 학년협의회\n• 10/20 수행평가 마감 1일 전');
+    return;
+  }
+  if (!p.text) { send_('내용이 비어 있어요.'); return; }
+  const id = appendItem(p.date, p.time, p.text, p.advance, p.repeat || '없음', '텔레그램', p.secret ? '비공개' : '');
+  let msg;
+  if (p.time === '종례') {
+    msg = '📢 ' + fmtDay_(p.date) + ' 종례 전달사항에 추가했어요 [#' + id + ']\n' + p.text +
+      (p.repeat ? ' (' + p.repeat + ')' : '') + '\n종례(' + jongryeTime_(p.date) + ') 전에 모아서 보내 드려요.' +
+      (p.secret ? '\n🔒 학급 페이지에는 표시하지 않아요.' : '\n📱 학급 페이지에도 표시돼요.');
+  } else if (p.time === '조회') {
+    msg = '🌅 ' + fmtDay_(p.date) + ' 조회 전달사항에 추가했어요 [#' + id + ']\n' + p.text +
+      (p.repeat ? ' (' + p.repeat + ')' : '') + '\n조회(' + johoeTime_(p.date) + ') 전에 모아서 보내 드려요.';
+  } else {
+    msg = '✅ 등록했어요\n' + lineText_({ id: id, date: p.date, time: p.time, text: p.text, repeat: p.repeat });
+    if (!p.time) msg += '\n(시각이 없어서 아침 요약으로 알려 드려요)';
+  }
+  if (p.advance) msg += '\n미리 알림: ' + p.advance;
+  send_(msg);
+}
+
+/** 시트 맨 아래에 한 줄 추가하고 ID를 돌려줌 */
+function appendItem(date, time, text, advance, repeat, source, memo) {
+  const sh = sheet_();
+  const last = sh.getLastRow();
+  let maxId = 0;
+  if (last >= 2) {
+    sh.getRange(2, 1, last - 1, 1).getValues().forEach(function (r) {
+      const n = Number(r[0]); if (n > maxId) maxId = n;
+    });
+  }
+  const id = maxId + 1;
+  sh.appendRow([id, date, time || '', text, advance || '', repeat || '없음', '예정', source || '', memo || '', '']);
+  return id;
+}
+
+function markDone_(arg) {
+  const m = String(arg).match(/(\d+)/);
+  if (!m) { send_('번호를 같이 보내 주세요. 예: /done 3'); return; }
+  const id = m[1];
+  const all = /전체|끝|종료/.test(arg);
+  const sh = sheet_();
+  const last = sh.getLastRow();
+  if (last < 2) { send_('#' + id + ' 일정을 찾지 못했어요.'); return; }
+  const vals = sh.getRange(2, 1, last - 1, NCOL).getDisplayValues();
+  for (let i = 0; i < vals.length; i++) {
+    const r = vals[i];
+    if (String(r[COL.ID]) !== id) continue;
+    const rowNo = i + 2;
+    const rep = String(r[COL.REPEAT] || '').trim();
+    if (rep && rep !== '없음' && !all) {
+      const next = nextDate_(normDate_(r[COL.DATE]), rep);
+      sh.getRange(rowNo, COL.DATE + 1).setValue(next);
+      sh.getRange(rowNo, COL.SENT + 1).setValue('');
+      send_('👍 이번 회차 완료. 다음은 ' + fmtDay_(next) + '\n' + r[COL.TEXT]);
+    } else {
+      sh.getRange(rowNo, COL.STATUS + 1).setValue('완료');
+      send_('👍 완료 처리했어요\n' + r[COL.TEXT]);
+    }
+    return;
+  }
+  send_('#' + id + ' 일정을 찾지 못했어요.');
+}
+
+/* ================= 문장 해석 ================= */
+
+function parseNatural_(input) {
+  let s = ' ' + String(input).replace(/\s+/g, ' ') + ' ';
+  const r = { date: '', time: '', advance: '', repeat: '', text: '' };
+  function take(re) { const m = s.match(re); if (m) s = s.replace(m[0], ' '); return m; }
+  const td = today_();
+  let m;
+
+  // 종례 전달사항 여부, 학급 페이지 비공개 여부
+  let slot = take(/종례\s*(때에?|시간에?|하면서|전에|에)?/) ? '종례' : '';
+  if (!slot && take(/조회\s*(때에?|시간에?|하면서|전에|에)?/)) slot = '조회';
+  const jong = !!slot;
+  const slotTime = slot === '조회' ? johoeTime_ : jongryeTime_;
+  r.secret = !!take(/[(\[]?비공개[)\]]?/);
+
+  // 미리 알림
+  const adv = [];
+  while ((m = take(/(\d+)\s*(분|시간|일|주)\s*전(에|부터)?/))) adv.push(m[1] + m[2] + ' 전');
+  r.advance = adv.join(', ');
+
+  // 반복
+  if ((m = take(/(매일|평일|매주|매월|매달|매년)(마다)?/))) r.repeat = m[1] === '매달' ? '매월' : m[1];
+
+  // 날짜
+  if ((m = take(/(\d{4})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})\s*일?/))) {
+    r.date = validDate_(Number(m[1]), Number(m[2]), Number(m[3]));
+  } else if ((m = take(/(\d{1,2})\s*월\s*(\d{1,2})\s*일/)) || (m = take(/(?:^|\s)(\d{1,2})\s*[/.]\s*(\d{1,2})(?=\D)/))) {
+    r.date = nearestMD_(Number(m[1]), Number(m[2]));
+  } else if ((m = take(/(\d+)\s*일\s*(후|뒤)/))) {
+    r.date = addDays_(td, Number(m[1]));
+  } else if ((m = take(/(오늘|내일|모레|글피)/))) {
+    r.date = addDays_(td, { '오늘': 0, '내일': 1, '모레': 2, '글피': 3 }[m[1]]);
+  } else if ((m = take(/(이번\s*주|다음\s*주|담주)\s*([월화수목금토일])(요일|(?=\s))/)) ||
+             (m = take(/()\s([월화수목금토일])요일/)) ||
+             (m = take(/()\s([월화수목금토])(?=\s)/))) {
+    const target = WEEK.indexOf(m[2]) + 1;
+    const cur = dow_(td);
+    if (/다음|담/.test(m[1])) r.date = addDays_(td, 7 - cur + target);
+    else if (/이번/.test(m[1])) r.date = addDays_(td, target - cur);
+    else r.date = addDays_(td, (target - cur + 7) % 7);
+  }
+
+  if (jong) {
+    if (r.repeat === '매일') r.repeat = '평일';
+    r.time = slot;
+    if (!r.date) {
+      r.date = td;
+      const jt = slotTime(td);
+      if (!jt || at_(td, jt) <= new Date()) r.date = nextSchoolDay_(td, false);
+    } else if (!slotTime(r.date)) {
+      r.date = nextSchoolDay_(r.date, false);
+    }
+    r.text = cleanText_(s);
+    return r;
+  }
+
+  // 시각
+  if ((m = take(/(오전|오후|아침|저녁|밤)?\s*(\d{1,2}):(\d{2})/))) {
+    r.time = hm_(m[1], m[2], m[3]);
+  } else if ((m = take(/(오전|오후|아침|저녁|밤)?\s*(\d{1,2})\s*시(\s*반|\s*(\d{1,2})\s*분)?/))) {
+    r.time = hm_(m[1], m[2], m[3] ? (/반/.test(m[3]) ? 30 : m[4]) : 0);
+  }
+
+  // 날짜 없이 반복/시각만 있는 경우
+  if (!r.date && (r.repeat || r.time)) {
+    r.date = td;
+    if (r.time && at_(td, r.time) <= new Date()) r.date = r.repeat ? nextDate_(td, r.repeat) : addDays_(td, 1);
+  }
+  if (r.date && r.repeat === '평일') { while (dow_(r.date) > 5) r.date = addDays_(r.date, 1); }
+  if (r.date && r.repeat && endOf_(r.date, r.time) <= new Date()) r.date = nextDate_(r.date, r.repeat);
+
+  r.text = cleanText_(s);
+  return r;
+}
+
+function cleanText_(s) {
+  return s.replace(/\s+[,，、]+/g, ' ').replace(/\s+/g, ' ').replace(/^\s*(에|에는|때|까지)\s+/, '').replace(/[\s,，、]+$/, '').trim();
+}
+
+function hm_(ap, h, mi) {
+  h = Number(h); mi = Number(mi || 0);
+  if (/오후|저녁|밤/.test(ap || '') && h < 12) h += 12;
+  if (ap === '오전' && h === 12) h = 0;
+  if (!ap && h >= 1 && h <= 6) h += 12;
+  return pad_(h) + ':' + pad_(mi);
+}
+
+function nearestMD_(mo, d) {
+  const y = Number(today_().slice(0, 4));
+  let ds = validDate_(y, mo, d);
+  if (ds && ds < today_()) ds = validDate_(y + 1, mo, d);
+  return ds;
+}
+
+function validDate_(y, mo, d) {
+  if (mo < 1 || mo > 12 || d < 1 || d > dim_(y, mo)) return '';
+  return y + '-' + pad_(mo) + '-' + pad_(d);
+}
+
+/* ================= 날짜 도우미 ================= */
+
+function pad_(n) { return ('0' + n).slice(-2); }
+function ymd_(d) { return Utilities.formatDate(d, TZ, 'yyyy-MM-dd'); }
+function today_() { return ymd_(new Date()); }
+function at_(dateStr, timeStr) { return Utilities.parseDate(dateStr + ' ' + (timeStr || '00:00'), TZ, 'yyyy-MM-dd HH:mm'); }
+function addDays_(dateStr, n) { return ymd_(new Date(at_(dateStr, '12:00').getTime() + n * 86400000)); }
+function dow_(dateStr) { return Number(Utilities.formatDate(at_(dateStr, '12:00'), TZ, 'u')); } // 1=월 … 7=일
+function dim_(y, m) { return new Date(Date.UTC(y, m, 0)).getUTCDate(); }
+
+function fmtDay_(dateStr) {
+  const p = dateStr.split('-');
+  return Number(p[1]) + '/' + Number(p[2]) + '(' + WEEK.charAt(dow_(dateStr) - 1) + ')';
+}
+
+function normDate_(s) {
+  const m = String(s).match(/(\d{4})\D+(\d{1,2})\D+(\d{1,2})/);
+  return m ? m[1] + '-' + pad_(m[2]) + '-' + pad_(m[3]) : '';
+}
+
+function normTime_(s) {
+  s = String(s || '');
+  const m = s.match(/(\d{1,2}):(\d{2})/);
+  if (!m) return '';
+  let h = Number(m[1]);
+  if (/오후|PM/i.test(s) && h < 12) h += 12;
+  if (/오전|AM/i.test(s) && h === 12) h = 0;
+  return pad_(h) + ':' + m[2];
+}
+
+function offsets_(s) {
+  const unit = { '분': 1, '시간': 60, '일': 1440, '주': 10080 };
+  const out = [];
+  const re = /(\d+)\s*(분|시간|일|주)\s*전/g;
+  let m;
+  while ((m = re.exec(String(s || '')))) out.push(Number(m[1]) * unit[m[2]]);
+  if (/당일|정각/.test(String(s || ''))) out.push(0);
+  return out;
+}
+
+function offsetLabel_(min) {
+  if (min % 10080 === 0) return (min / 10080) + '주';
+  if (min % 1440 === 0) return (min / 1440) + '일';
+  if (min % 60 === 0) return (min / 60) + '시간';
+  return min + '분';
+}
+
+function nextDate_(d, rep) {
+  if (!d) return '';
+  if (/매일/.test(rep)) return addDays_(d, 1);
+  if (/평일/.test(rep)) { let n = addDays_(d, 1); while (dow_(n) > 5) n = addDays_(n, 1); return n; }
+  if (/매주/.test(rep)) return addDays_(d, 7);
+  const p = d.split('-').map(Number);
+  if (/매월/.test(rep)) {
+    let y = p[0], mo = p[1] + 1;
+    if (mo > 12) { mo = 1; y++; }
+    return y + '-' + pad_(mo) + '-' + pad_(Math.min(p[2], dim_(y, mo)));
+  }
+  if (/매년/.test(rep)) return (p[0] + 1) + '-' + pad_(p[1]) + '-' + pad_(Math.min(p[2], dim_(p[0] + 1, p[1])));
+  return '';
+}
+
+/* ================= 수업 준비 알림 (2학기 계획 시트) ================= */
+/*
+ * 계획 시트 구조: B~F열 = 월~금
+ *  - 날짜 행: B~F에 날짜(또는 "10/19 (수 시간표)" 같은 글자)
+ *  - 그 아래 교시별 2줄: A열에 교시 번호가 있는 줄 = 수업(반), 바로 아래 줄 = 진도·준비 내용
+ */
+
+function planSheet_() {
+  const id = String(getSetting_('수업 계획 시트 ID') || '').trim();
+  if (!id) return null;
+  const ss = SpreadsheetApp.openById(id);
+  return ss.getSheets()[0];
+}
+
+/** 계획 시트 전체를 { 'yyyy-MM-dd': { note, items:[{period, cls, content}] } } 로 읽음 */
+function readPlan_() {
+  const sh = planSheet_();
+  if (!sh) return {};
+  const last = sh.getLastRow();
+  if (last < 2) return {};
+  const vals = sh.getRange(1, 1, last, 6).getValues();
+  const disp = sh.getRange(1, 1, last, 6).getDisplayValues();
+  const plan = {};
+  let cols = null;      // 현재 주의 [열번호→날짜]
+  let firstMonth = 0, baseYear = 0;
+
+  function cellDate(v, d) {
+    if (v instanceof Date && !isNaN(v)) return { date: ymd_(v), note: '' };
+    const m = String(d || v || '').match(/^\s*(\d{1,2})\s*[\/.]\s*(\d{1,2})\s*(.*)$/);
+    if (!m) return null;
+    const mo = Number(m[1]), day = Number(m[2]);
+    if (mo < 1 || mo > 12 || day < 1 || day > 31) return null;
+    let y = baseYear || Number(today_().slice(0, 4));
+    if (firstMonth && mo < firstMonth) y += 1; // 2학기 계획이 해를 넘기는 경우
+    return { date: validDate_(y, mo, day), note: String(m[3] || '').replace(/^[\s(]+|[\s)]+$/g, '') };
+  }
+
+  for (let r = 0; r < vals.length; r++) {
+    // 날짜 행인지 확인
+    const heads = [];
+    for (let c = 1; c <= 5; c++) {
+      const h = cellDate(vals[r][c], disp[r][c]);
+      if (h && h.date) heads.push({ c: c, h: h });
+    }
+    if (heads.length >= 2 && String(disp[r][0]).trim() === '') {
+      cols = {};
+      heads.forEach(function (x) {
+        if (!baseYear) { baseYear = Number(x.h.date.slice(0, 4)); firstMonth = Number(x.h.date.slice(5, 7)); }
+        cols[x.c] = x.h.date;
+        if (!plan[x.h.date]) plan[x.h.date] = { note: x.h.note, items: [], chars: [] };
+      });
+      continue;
+    }
+    if (!cols) continue;
+    const period = Number(String(disp[r][0]).trim());
+    if (!(period >= 1 && period <= 8)) continue;
+    for (let c = 1; c <= 5; c++) {
+      const date = cols[c];
+      if (!date) continue;
+      const cls = String(disp[r][c] || '').trim();
+      const content = r + 1 < vals.length && String(disp[r + 1][0]).trim() === '' ? String(disp[r + 1][c] || '').trim() : '';
+      if (!cls && !content) continue;
+      plan[date].items.push({ period: period, cls: cls, content: content });
+    }
+  }
+
+  // 세로로 한 글자씩 쓴 행사(모/의/고/사, 대/체/공/휴/일)는 하루 메모로 합침
+  Object.keys(plan).forEach(function (d) {
+    const it = plan[d].items;
+    if (it.length >= 2 && it.every(function (x) { return x.cls.length <= 1 && !x.content; })) {
+      plan[d].note = (plan[d].note ? plan[d].note + ' · ' : '') + it.map(function (x) { return x.cls; }).join('');
+      plan[d].items = [];
+    }
+    delete plan[d].chars;
+  });
+  return plan;
+}
+
+/** today 이후 처음으로 수업이 있는 날 */
+function nextClassDay_(plan, after) {
+  return Object.keys(plan).sort().filter(function (d) { return d > after && plan[d].items.length; })[0] || '';
+}
+
+function clsLabel_(cls) {
+  if (/^10[3-8]$/.test(cls)) return cls + ' 과탐실';
+  return cls;
+}
+
+function prepText_(plan, date, head) {
+  const day = plan[date];
+  if (!day) return '📚 ' + fmtDay_(date) + ' 계획이 시트에 없어요.';
+  let s = '📚 ' + (head || '') + fmtDay_(date) + ' 수업 준비' + (day.note ? ' (' + day.note + ')' : '');
+  if (!day.items.length) return s + '\n수업이 없어요.';
+  const lines = day.items.slice().sort(function (a, b) { return a.period - b.period; }).map(function (x) {
+    const label = x.cls ? clsLabel_(x.cls) : '';
+    const content = x.content ? x.content.replace(/\n+/g, ' · ') : '';
+    return '• ' + x.period + '교시 ' + (label || '') + (content ? (label ? ': ' : '') + content : (label ? '' : '-'));
+  });
+  // 같은 내용을 여러 반에서 하면 묶어서 한 번 더 요약
+  const byContent = {};
+  day.items.forEach(function (x) { if (x.content) (byContent[x.content] = byContent[x.content] || []).push(x.cls); });
+  const prep = Object.keys(byContent).map(function (c) {
+    return '  - ' + c.replace(/\n+/g, ' · ') + (byContent[c].length > 1 ? ' (' + byContent[c].join(', ') + ')' : '');
+  });
+  const withContent = day.items.filter(function (x) { return x.content; }).length;
+  const showPrep = prep.length && prep.length < withContent; // 여러 반이 같은 걸 할 때만 묶어서 보여 줌
+  return s + '\n' + lines.join('\n') + (showPrep ? '\n\n🧰 준비할 것\n' + prep.join('\n') : '');
+}
+
+/** checkReminders에서 호출: 퇴근 시각에 다음 수업일 준비 알림 */
+function checkPrep_(now, props) {
+  if (getSetting_('수업 준비 알림') === '끔') return;
+  if (!getSetting_('수업 계획 시트 ID')) return;
+  const td = today_();
+  if (dow_(td) > 5) return;
+  if (props.getProperty('LAST_PREP_DAY') === td) return;
+  const at = at_(td, normTime_(getSetting_('수업 준비 알림 시각')) || '16:50');
+  if (now < at || now - at > 3 * 3600000) return;
+  const plan = readPlan_();
+  const target = nextClassDay_(plan, td);
+  if (!target || props.getProperty('LAST_PREP_TARGET') === target) { props.setProperty('LAST_PREP_DAY', td); return; } // 같은 날 준비는 한 번만
+  const head = target === addDays_(td, 1) ? '내일 ' : '다음 수업일 ';
+  send_(prepText_(plan, target, head));
+  // 보내기에 성공한 뒤에만 '보냄'으로 기록 (실패하면 5분 뒤 다시 시도)
+  props.setProperty('LAST_PREP_DAY', td);
+  props.setProperty('LAST_PREP_TARGET', target);
+}
+
+/** /prep, /prep 내일, /prep 10/27 */
+function prepCommand_(arg) {
+  const plan = readPlan_();
+  if (!Object.keys(plan).length) { send_("'설정' 탭의 '수업 계획 시트 ID'를 확인해 주세요."); return; }
+  const td = today_();
+  let date = '';
+  if (/오늘/.test(arg)) date = td;
+  else if (arg && !/내일|다음/.test(arg)) date = parseNatural_(arg + ' x').date;
+  if (!date) date = nextClassDay_(plan, td);
+  if (!date) { send_('앞으로 남은 수업 계획이 없어요.'); return; }
+  send_(prepText_(plan, date, date === addDays_(td, 1) ? '내일 ' : ''));
+}
+
+/* ================= 학급 정보 (청소·칠판·바로가기) ================= */
+
+const CLASS_NAME = '학급';
+const NOTICE_NAME = '안내';
+
+function classInfo_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CLASS_NAME);
+  const vals = sh ? sh.getDataRange().getDisplayValues() : [];
+  function get(label) {
+    for (let i = 0; i < vals.length; i++) if (String(vals[i][0]).trim() === label) return String(vals[i][1]).trim();
+    return '';
+  }
+  const links = [];
+  let inLinks = false;
+  vals.forEach(function (r) {
+    const a = String(r[0]).trim();
+    if (a === '바로가기') { inLinks = true; return; }
+    if (!inLinks) return;
+    if (!a) { inLinks = false; return; }
+    const url = String(r[1] || '').trim();
+    if (/^https?:\/\//.test(url)) links.push({ name: a, url: url, desc: String(r[2] || '').trim() });
+  });
+  return {
+    name: get('학급 이름') || '우리 반',
+    pageUrl: /^https?:\/\//.test(get('페이지 주소')) ? get('페이지 주소') : '',
+    base: normDate_(get('기준 주 (그 주 월요일)')),
+    cleanOrder: splitList_(get('청소 조 순서')),
+    cleanBase: get('기준 주 청소 조'),
+    boardOrder: splitList_(get('칠판 담당 순서')),
+    boardBase: get('기준 주 칠판 담당'),
+    links: links
+  };
+}
+
+function splitList_(s) {
+  return String(s || '').split(/[,，、\n]/).map(function (x) { return x.trim(); }).filter(String);
+}
+
+function mondayOf_(date) { return addDays_(date, 1 - dow_(date)); }
+
+function weeksBetween_(fromMonday, toMonday) {
+  return Math.round((at_(toMonday, '12:00') - at_(fromMonday, '12:00')) / (7 * 86400000));
+}
+
+function rotate_(order, baseName, w) {
+  if (!order.length) return '';
+  let idx = order.indexOf(baseName);
+  if (idx < 0) idx = 0;
+  const n = order.length;
+  return order[((idx + w) % n + n) % n];
+}
+
+/** 그 날짜가 속한 주의 청소 조와 칠판 담당 */
+function dutyFor_(date, info) {
+  info = info || classInfo_();
+  if (!info.base || (!info.cleanOrder.length && !info.boardOrder.length)) return null;
+  const w = weeksBetween_(mondayOf_(info.base), mondayOf_(date));
+  return {
+    clean: rotate_(info.cleanOrder, info.cleanBase, w) || '-',
+    board: rotate_(info.boardOrder, info.boardBase, w) || '-'
+  };
+}
+
+/* ================= 학급 페이지 안내 ================= */
+
+function noticeSheet_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(NOTICE_NAME);
+  if (!sh) throw new Error("'" + NOTICE_NAME + "' 탭을 찾을 수 없어요.");
+  return sh;
+}
+
+function photoFolder_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('PHOTO_FOLDER');
+  if (id) {
+    try { return DriveApp.getFolderById(id); } catch (e) { /* 지워졌으면 새로 만듦 */ }
+  }
+  const folder = DriveApp.createFolder('학급 페이지 사진');
+  props.setProperty('PHOTO_FOLDER', folder.getId());
+  return folder;
+}
+
+/** "제목 | 내용 ~10/30" 해석 */
+function parseNotice_(s) {
+  s = String(s || '').trim();
+  let end = '';
+  const m = s.match(/~\s*(\d{1,2})\s*[/.월]\s*(\d{1,2})\s*일?|(\d{1,2})\s*[/.월]\s*(\d{1,2})\s*일?\s*까지\s*(게시)?/);
+  if (m && (m[0].indexOf('~') === 0 || /게시/.test(m[0]))) {
+    end = nearestMD_(Number(m[1] || m[3]), Number(m[2] || m[4]));
+    s = s.replace(m[0], ' ').trim();
+  }
+  let cat = '';
+  const cm = s.match(/^\s*[\[(]?\s*(수행평가|수행|행사|기타)\s*[\])]?\s*/);
+  if (cm) { cat = cm[1] === '수행' ? '수행평가' : cm[1]; s = s.slice(cm[0].length); }
+  const parts = s.split(/\s*\|\s*|\n/);
+  const title = (parts.shift() || '').trim();
+  if (!cat) cat = /수행|평가|과제|발표|보고서/.test(s) ? '수행평가' : '행사';
+  return { title: title, body: parts.join('\n').trim(), end: end || addDays_(today_(), 14), cat: cat };
+}
+
+function appendNotice_(title, body, photoId, end, cat) {
+  const sh = noticeSheet_();
+  const last = sh.getLastRow();
+  let maxId = 0;
+  if (last >= 2) sh.getRange(2, 1, last - 1, 1).getValues().forEach(function (r) { const n = Number(r[0]); if (n > maxId) maxId = n; });
+  const id = maxId + 1;
+  sh.appendRow([id, today_(), title, body || '', photoId || '', end, '공개', cat || '행사']);
+  return id;
+}
+
+function handlePhoto_(fileId, caption) {
+  const f = tg_('getFile', { file_id: fileId });
+  if (!f || !f.ok) { send_('사진을 받지 못했어요. (20MB 이하만 가능)'); return; }
+  const token = PropertiesService.getScriptProperties().getProperty('BOT_TOKEN');
+  const res = UrlFetchApp.fetch('https://api.telegram.org/file/bot' + token + '/' + f.result.file_path, { muteHttpExceptions: true });
+  if (res.getResponseCode() !== 200) { send_('사진을 내려받지 못했어요.'); return; }
+  const ext = (String(f.result.file_path).match(/\.\w+$/) || ['.jpg'])[0];
+  const file = photoFolder_().createFile(res.getBlob().setName('안내_' + Utilities.formatDate(new Date(), TZ, 'yyyyMMdd_HHmmss') + ext));
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  const p = parseNotice_(caption);
+  const id = appendNotice_(p.title || '안내', p.body, file.getId(), p.end, p.cat);
+  send_('🖼 학급 페이지 [' + p.cat + ']에 올렸어요 [안내 #' + id + ']\n' + (p.title || '안내') + '\n' + fmtDay_(p.end) + '까지 게시돼요. 내리려면 /hide ' + id);
+}
+
+function addTextNotice_(arg) {
+  if (!arg) { send_('예: /notice 수행평가 안내 | 10/30까지 보고서 제출 ~10/30'); return; }
+  const p = parseNotice_(arg);
+  if (!p.title) { send_('제목이 비어 있어요.'); return; }
+  const id = appendNotice_(p.title, p.body, '', p.end, p.cat);
+  send_('📌 학급 페이지 [' + p.cat + ']에 올렸어요 [안내 #' + id + ']\n' + p.title + '\n' + fmtDay_(p.end) + '까지 게시돼요.');
+}
+
+function activeNotices_() {
+  const sh = noticeSheet_();
+  const last = sh.getLastRow();
+  if (last < 2) return [];
+  const td = today_();
+  const ncol = Math.max(7, Math.min(8, sh.getLastColumn()));
+  return sh.getRange(2, 1, last - 1, ncol).getDisplayValues()
+    .map(function (r) {
+      const photos = String(r[4] || '').split(/[,\s]+/).map(driveId_).filter(String); // 사진 여러 장은 쉼표로 구분
+      return { id: r[0], date: normDate_(r[1]), title: r[2], body: r[3], photo: photos[0] || '', photos: photos, end: normDate_(r[5]),
+        open: String(r[6]).trim() !== '비공개', cat: String(r[7] || '').trim() || '행사' };
+    })
+    .filter(function (n) { return n.open && (n.title || n.body || n.photo) && (!n.end || n.end >= td); })
+    .sort(function (a, b) { return (b.date || '').localeCompare(a.date || '') || Number(b.id) - Number(a.id); });
+}
+
+function driveId_(s) {
+  s = String(s || '').trim();
+  const m = s.match(/\/d\/([\w-]{20,})/) || s.match(/[?&]id=([\w-]{20,})/) || s.match(/^([\w-]{20,})$/);
+  return m ? m[1] : '';
+}
+
+function noticeListText_() {
+  const list = activeNotices_();
+  if (!list.length) return '게시 중인 안내가 없어요.';
+  return '📌 게시 중인 안내\n' + list.map(function (n) {
+    return '#' + n.id + ' [' + n.cat + '] ' + n.title + (n.photo ? ' 🖼' : '') + (n.end ? ' (~' + fmtDay_(n.end) + ')' : '');
+  }).join('\n');
+}
+
+function hideNotice_(arg) {
+  const m = String(arg).match(/(\d+)/);
+  if (!m) { send_('번호를 같이 보내 주세요. 예: /hide 2'); return; }
+  const sh = noticeSheet_();
+  const last = sh.getLastRow();
+  if (last >= 2) {
+    const ids = sh.getRange(2, 1, last - 1, 1).getDisplayValues();
+    for (let i = 0; i < ids.length; i++) {
+      if (String(ids[i][0]) === m[1]) {
+        sh.getRange(i + 2, 7).setValue('비공개');
+        send_('안내 #' + m[1] + '을(를) 내렸어요.');
+        return;
+      }
+    }
+  }
+  send_('안내 #' + m[1] + '을(를) 찾지 못했어요.');
+}
+
+/* ================= 청소 구역 · 1인 1역 ================= */
+
+function normGroup_(s) { return String(s || '').replace(/\s+/g, ''); }
+
+/** '청소구역' 탭: 첫 줄 = 구역 | A조 | B조 ... */
+function cleaningAreas_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('청소구역');
+  if (!sh || sh.getLastRow() < 2) return { groups: [], rows: [] };
+  const vals = sh.getDataRange().getDisplayValues();
+  const groups = vals[0].slice(1).map(normGroup_).filter(String);
+  const rows = vals.slice(1).filter(function (r) { return String(r[0]).trim(); }).map(function (r) {
+    const by = {};
+    groups.forEach(function (g, k) { by[g] = String(r[k + 1] || '').trim(); });
+    return { area: String(r[0]).trim(), by: by };
+  });
+  return { groups: groups, rows: rows };
+}
+
+/** '1인1역' 탭: 연번 | 역할 | 하는 일 | 이름. 같은 역할이 이어지면 한 칸으로 묶음 */
+function roles_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('1인1역');
+  if (!sh || sh.getLastRow() < 2) return [];
+  const vals = sh.getDataRange().getDisplayValues().slice(1);
+  const out = [];
+  vals.forEach(function (r) {
+    const role = String(r[1] || '').trim();
+    const tasks = String(r[2] || '').trim();
+    const name = String(r[3] || '').trim();
+    if (!role && !name) return;
+    const prev = out[out.length - 1];
+    if (prev && (!role || role === prev.role) && (!tasks || tasks === prev.tasks)) {
+      if (name) prev.names.push(name);
+      return;
+    }
+    out.push({ role: role || (prev ? prev.role : ''), tasks: tasks || (prev && role === prev.role ? prev.tasks : ''), names: name ? [name] : [] });
+  });
+  return out;
+}
+
+/* ================= 학급 페이지 (웹 앱) ================= */
+
+function doGet(e) {
+  const info = classInfo_();
+  // Vercel 첫 화면(index.html)이 내용만 받아 갈 때: ?format=json
+  if (e && e.parameter && e.parameter.format === 'json') {
+    // 평소에는 5분마다 미리 만들어 둔 화면을 바로 돌려줌. 새로고침 버튼(fresh=1)은 그 자리에서 새로 만듦
+    const cache = CacheService.getScriptCache();
+    let json = null;
+    if (!e.parameter.fresh) {
+      const got = cache.getAll([PAGE_CACHE_KEY, PAGE_CACHE_KEY + '-at']);
+      const age = Date.now() - Number(got[PAGE_CACHE_KEY + '-at'] || 0);
+      if (got[PAGE_CACHE_KEY] && age < 6 * 60 * 1000) json = got[PAGE_CACHE_KEY]; // 6분 넘은 건 쓰지 않음
+    }
+    if (!json) json = buildPageCache_(info);
+    // ?callback=이름 이 있으면 스크립트로 불러갈 수 있는 형태(JSONP)로 돌려줌 (아이폰에서 가장 안정적)
+    const cb = String(e.parameter.callback || '');
+    if (/^[A-Za-z_$][\w$]{0,40}$/.test(cb)) {
+      return ContentService.createTextOutput(cb + '(' + json + ');').setMimeType(ContentService.MimeType.JAVASCRIPT);
+    }
+    return ContentService.createTextOutput(json).setMimeType(ContentService.MimeType.JSON);
+  }
+  return HtmlService.createHtmlOutput(renderPage_(info))
+    .setTitle(info.name)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+const PAGE_CACHE_KEY = 'classpage-json';
+
+/** 학급 페이지 내용을 만들어 6시간짜리 임시 저장소에 넣어 둠 (5분마다 checkReminders가 다시 만듦) */
+function buildPageCache_(info) {
+  const parts = renderParts_(info || classInfo_());
+  parts.builtAt = Date.now();
+  const json = JSON.stringify(parts);
+  try {
+    const obj = {};
+    obj[PAGE_CACHE_KEY] = json;
+    obj[PAGE_CACHE_KEY + '-at'] = String(parts.builtAt);
+    CacheService.getScriptCache().putAll(obj, 21600);
+  } catch (e) { /* 너무 크면 저장 생략 */ }
+  return json;
+}
+
+function refreshPageCache_() {
+  try { buildPageCache_(); } catch (e) { /* 페이지 갱신 실패는 알림에 영향 주지 않음 */ }
+}
+
+function renderPage_(info) {
+  const p = renderParts_(info);
+  return '<!doctype html><html lang="ko"><head><meta charset="utf-8"><style>' + p.css + '</style></head><body>' +
+    p.body + '<script>' + p.js + '</script></body></html>';
+}
+
+function esc_(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function renderParts_(info) {
+  const td = today_();
+  const nowHm = Utilities.formatDate(new Date(), TZ, 'HH:mm');
+  let selfUrl = info.pageUrl;
+  if (!selfUrl) { try { selfUrl = ScriptApp.getService().getUrl(); } catch (e) { selfUrl = ''; } }
+  const duty = dutyFor_(td, info);
+  const mon = mondayOf_(td);
+  const jDay = nextSchoolDay_(td, true);
+  const jt = jongryeTime_(jDay);
+  const jItems = jongryeItems_(jDay).filter(function (it) { return !/비공개/.test(it.memo); });
+  const notices = activeNotices_();
+  const jLabel = jDay === td ? '오늘 종례' : fmtDay_(jDay) + ' 종례';
+
+
+  const jHtml = jItems.length
+    ? '<ol class="list">' + jItems.map(function (it) { return '<li>' + esc_(it.text) + '</li>'; }).join('') + '</ol>'
+    : '<p class="empty">전달사항이 없어요.</p>';
+
+  function noticeCards(list) {
+    return list.map(function (n) {
+        return '<article class="notice">' +
+          (n.photos || []).map(function (p, k) {
+            return '<a class="nimg" href="https://drive.google.com/file/d/' + esc_(p) + '/view" target="_blank" rel="noopener">' +
+              '<img loading="lazy" src="https://drive.google.com/thumbnail?id=' + esc_(p) + '&sz=w1200" alt="' + esc_(n.title) +
+              (n.photos.length > 1 ? ' ' + (k + 1) + '쪽' : '') + '"></a>';
+          }).join('') +
+          '<div class="nbody"><h3>' + esc_(n.title) + '</h3>' +
+          (n.body ? '<p>' + esc_(n.body).replace(/\n/g, '<br>') + '</p>' : '') +
+          '<p class="sub">' + (n.date ? fmtDay_(n.date) + ' 게시' : '') + (n.end ? ' · ' + fmtDay_(n.end) + '까지' : '') + '</p></div></article>';
+      }).join('');
+  }
+  // 안내: 수행평가 / 행사 (+ 기타가 있으면)
+  const cats = ['수행평가', '행사'];
+  notices.forEach(function (n) { if (cats.indexOf(n.cat) < 0) cats.push(n.cat); });
+  const nHtml = cats.map(function (c) {
+    const list = notices.filter(function (n) { return n.cat === c; });
+    if (!list.length && c !== '수행평가' && c !== '행사') return '';
+    return '<details class="fold"><summary><span class="ftitle">' + esc_(c) +
+      (list.length ? '<span class="tag">' + list.length + '</span>' : '') + '</span>' +
+      '<span class="hint">' + (list.length ? '눌러서 보기' : '아직 없어요') + '</span></summary>' +
+      '<div class="inner">' + (list.length ? noticeCards(list) : '<p class="empty">등록된 안내가 없어요.</p>') + '</div></details>';
+  }).join('');
+
+  // 청소 구역
+  const cl = cleaningAreas_();
+  const thisGroup = duty ? normGroup_(duty.clean) : (cl.groups[0] || '');
+  function cleanList(g) {
+    return '<ul class="rows">' + cl.rows.map(function (r) {
+      return '<li><span class="area">' + esc_(r.area) + '</span><span class="who">' + esc_(r.by[g] || '-') + '</span></li>';
+    }).join('') + '</ul>';
+  }
+  // 이번 주 당번: 청소 칸을 누르면 그 조의 구역이 펼쳐짐
+  const hasAreas = cl.rows.length > 0 && cl.groups.indexOf(thisGroup) >= 0;
+  const others = cl.groups.filter(function (g) { return g !== thisGroup; });
+  const dutyHtml = duty
+    ? '<div class="duty">' +
+        (hasAreas
+          ? '<button type="button" class="pill tap" id="cleanBtn" aria-expanded="false" aria-controls="cleanPanel">' +
+            '<span class="k">청소</span><span class="v">' + esc_(duty.clean) + '</span><span class="tiny">눌러서 구역 보기 ▾</span></button>'
+          : '<div class="pill"><span class="k">청소</span><span class="v">' + esc_(duty.clean) + '</span></div>') +
+        '<div class="pill"><span class="k">칠판</span><span class="v">' + esc_(duty.board) + '</span></div></div>' +
+      (hasAreas
+        ? '<div id="cleanPanel" class="panel" hidden><h3 class="ph">' + esc_(thisGroup) + ' 청소 구역</h3>' + cleanList(thisGroup) +
+          others.map(function (g) {
+            return '<details class="more"><summary>' + esc_(g) + ' 구역도 보기</summary>' + cleanList(g) + '</details>';
+          }).join('') + '</div>'
+        : '') +
+      '<p class="sub">' + fmtDay_(mon) + ' ~ ' + fmtDay_(addDays_(mon, 4)) + '</p>'
+    : '<p class="empty">아직 정해지지 않았어요.</p>';
+  const cHtml = '';
+
+  // 1인 1역
+  const roles = roles_();
+  const rHtml = roles.length
+    ? '<details class="fold"><summary><span class="ftitle">1인 1역</span><span class="hint">눌러서 역할 보기</span></summary>' +
+      '<div class="inner">' + roles.map(function (r) {
+        return '<details class="role"><summary><span class="rname">' + esc_(r.role) + '</span><span class="who">' +
+          esc_(r.names.join(', ')) + '</span></summary>' +
+          (r.tasks ? '<p>' + esc_(r.tasks).replace(/\n/g, '<br>') + '</p>' : '') + '</details>';
+      }).join('') + '</div></details>'
+    : '';
+
+  // 이름 찾기용 데이터
+  const searchData = {
+    thisGroup: thisGroup,
+    board: duty ? duty.board : '',
+    clean: cl.rows.map(function (r) { return { area: r.area, by: r.by }; }),
+    roles: roles.map(function (r) { return { role: r.role, names: r.names }; })
+  };
+  const sHtml = (cl.rows.length || roles.length)
+    ? '<section><h2>내 이름으로 찾기</h2><input id="q" type="search" placeholder="이름을 입력하세요 (예: 김주환)" autocomplete="off">' +
+      '<div id="res"></div></section>'
+    : '';
+  const jsCode = '(function(){var D=' + JSON.stringify(searchData).replace(/</g, '\\u003c') + ';' +
+    'var q=document.getElementById("q"),res=document.getElementById("res");if(!q)return;' +
+    'function bare(s){return String(s).replace(/\\d+\\s*\\.\\s*/g,"").replace(/\\s+/g,"");}' +
+    'function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c];});}' +
+    'function run(){var k=bare(q.value);if(!k){res.innerHTML="";return;}var out=[];' +
+    'if(D.board&&bare(D.board).indexOf(k)>=0)out.push("🖍 이번 주 칠판 담당");' +
+    'D.clean.forEach(function(r){var gs=Object.keys(r.by),hit=gs.filter(function(g){return bare(r.by[g]).indexOf(k)>=0;});' +
+    'if(gs.length>1&&hit.length===gs.length){out.push("🧹 청소: "+esc(r.area)+" (매주)");return;}' +
+    'hit.forEach(function(g){out.push("🧹 청소: "+esc(r.area)+" ("+esc(g)+(g===D.thisGroup?" · 이번 주":" · 다음 차례")+")");});});' +
+    'D.roles.forEach(function(r){r.names.forEach(function(n){if(bare(n).indexOf(k)>=0)out.push("🙋 1인 1역: "+esc(r.role)+" ("+esc(n)+")");});});' +
+    'res.innerHTML=out.length?"<ul class=\\"hits\\"><li>"+out.join("</li><li>")+"</li></ul>":"<p class=\\"empty\\">찾는 이름이 없어요.</p>";}' +
+    'q.addEventListener("input",run);})();' +
+    '(function(){var b=document.getElementById("cleanBtn"),p=document.getElementById("cleanPanel");if(!b||!p)return;' +
+    'b.addEventListener("click",function(){var open=p.hidden;p.hidden=!open;b.setAttribute("aria-expanded",open?"true":"false");' +
+    'b.querySelector(".tiny").textContent=open?"접기 ▴":"눌러서 구역 보기 ▾";});})();';
+
+  const lHtml = info.links.length
+    ? '<div class="links">' + info.links.map(function (l) {
+        return '<a class="link" href="' + esc_(l.url) + '" target="_blank" rel="noopener"><span class="lname">' + esc_(l.name) + '</span>' +
+          (l.desc ? '<span class="ldesc">' + esc_(l.desc) + '</span>' : '') + '<span class="arrow">→</span></a>';
+      }).join('') + '</div>'
+    : '';
+
+  const css = [
+    ':root{--bg:#f4f5f7;--card:#fff;--ink:#1d2433;--muted:#6b7385;--line:#e4e7ee;--accent:#2f5b99;--accent-soft:#e8eef8}',
+    '@media (prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1b1f27;--ink:#e8ebf2;--muted:#9aa3b5;--line:#2a303b;--accent:#8fb3ea;--accent-soft:#223149}}',
+    '*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",sans-serif;line-height:1.55;-webkit-text-size-adjust:100%}',
+    '.wrap{max-width:560px;margin:0 auto;padding:20px 16px 40px}',
+    'header{padding:8px 4px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:12px}header h1{margin:0;font-size:26px;letter-spacing:-.02em}header p{margin:2px 0 0;color:var(--muted);font-size:14px}',
+    '.reload{display:inline-block;flex-shrink:0;font-size:14px;font-weight:600;color:var(--accent);background:var(--accent-soft);border-radius:999px;padding:8px 14px;text-decoration:none;margin-top:4px}',
+    '.reload:active{opacity:.7}footer .reload{margin-top:0}',
+    'section{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:12px}',
+    'h2{margin:0 0 12px;font-size:15px;color:var(--muted);font-weight:600}',
+    '.duty{display:flex;gap:8px}.pill{flex:1;background:var(--accent-soft);border-radius:12px;padding:12px;text-align:center}',
+    '.pill .k{display:block;font-size:13px;color:var(--muted)}.pill .v{display:block;font-size:22px;font-weight:700;color:var(--accent)}',
+    '.sub{margin:8px 0 0;font-size:12px;color:var(--muted)}.empty{margin:0;color:var(--muted)}',
+    '.list{margin:0;padding-left:22px}.list li{padding:4px 0;font-size:16px}',
+    '.notice{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}.notice:first-child{border-top:0;padding-top:0;margin-top:0}',
+    '.notice img{width:100%;border-radius:10px;display:block;background:var(--line)}.nbody h3{margin:10px 0 4px;font-size:16px}.nbody p{margin:0}',
+    '.links{display:grid;gap:8px}.link{display:flex;align-items:center;gap:8px;padding:14px;border:1px solid var(--line);border-radius:12px;color:var(--ink);text-decoration:none}',
+    '.link:active{background:var(--accent-soft)}.lname{font-weight:600}.ldesc{color:var(--muted);font-size:13px;flex:1}.arrow{margin-left:auto;color:var(--accent)}',
+    'footer{text-align:center;color:var(--muted);font-size:12px;margin-top:16px}',
+    '#q{width:100%;font-size:16px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink)}',
+    '#q:focus{outline:2px solid var(--accent);outline-offset:1px}.hits{margin:10px 0 0;padding:0;list-style:none}.hits li{padding:8px 0;border-bottom:1px solid var(--line)}.hits li:last-child{border-bottom:0}',
+    '.rows{margin:0;padding:0;list-style:none}.rows li{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--line)}.rows li:last-child{border-bottom:0}',
+    '.area{color:var(--muted);flex-shrink:0}.who{font-weight:600;text-align:right;flex:1}',
+    'details.more{margin-top:10px}details summary{cursor:pointer;color:var(--accent);font-size:14px;padding:6px 0}',
+    'details.role{border-bottom:1px solid var(--line)}details.role:last-child{border-bottom:0}',
+    'details.role summary{display:flex;justify-content:space-between;gap:12px;color:var(--ink);font-size:15px;padding:10px 0;list-style:none}',
+    'details.role summary::-webkit-details-marker{display:none}details.role summary .rname::before{content:"▸ ";color:var(--muted)}details.role[open] summary .rname::before{content:"▾ "}',
+    'details.role p{margin:0 0 10px;color:var(--muted);font-size:14px}',
+    'details.fold{border:1px solid var(--line);border-radius:12px;padding:0 14px;margin-top:8px}details.fold:first-of-type{margin-top:0}',
+    'details.fold>summary{display:flex;align-items:center;justify-content:space-between;gap:8px;list-style:none;color:var(--ink);padding:13px 0;font-size:16px}',
+    'details.fold>summary::-webkit-details-marker{display:none}.ftitle{font-weight:700;display:flex;align-items:center;gap:8px}',
+    '.tag{font-size:12px;font-weight:600;color:var(--accent);background:var(--accent-soft);border-radius:999px;padding:2px 8px}',
+    '.hint{font-size:12px;color:var(--muted)}.hint::after{content:" ▾"}details.fold[open]>summary .hint{visibility:hidden}',
+    'details.fold[open]>summary{border-bottom:1px solid var(--line)}details.fold .rows,details.fold .inner{padding-bottom:6px}',
+    'details.fold .inner .notice:first-child{padding-top:12px}details.fold .inner .empty{padding:12px 0 6px}',
+    '.nimg{display:block}.nimg+.nimg{margin-top:8px}',
+    'button.pill{font:inherit;color:inherit;border:0;cursor:pointer;-webkit-tap-highlight-color:transparent}',
+    'button.pill.tap{outline:1px solid transparent}button.pill.tap:active,button.pill.tap[aria-expanded="true"]{outline:2px solid var(--accent)}',
+    '.tiny{display:block;font-size:11px;color:var(--muted);margin-top:2px}',
+    '.panel{margin-top:12px;border-top:1px solid var(--line);padding-top:4px}.ph{margin:8px 0 2px;font-size:14px;color:var(--accent)}',
+    'section>details.fold:only-child{margin-top:0}'
+  ].join('');
+
+  const body = '<div class="wrap">' +
+    '<header><div><h1>' + esc_(info.name) + '</h1><p>' + fmtDay_(td) + ' · ' + nowHm + ' 기준</p></div>' +
+    '<a class="reload" href="' + esc_(selfUrl) + '" target="_top" aria-label="새로고침">↻ 새로고침</a></header>' +
+    '<section><h2>이번 주 당번</h2>' + dutyHtml + '</section>' +
+    '<section><h2>' + jLabel + (jt ? ' · ' + jt : '') + '</h2>' + jHtml + '</section>' +
+    '<section><h2>안내</h2>' + nHtml + '</section>' +
+    (cHtml ? '<section>' + cHtml + '</section>' : '') +
+    (rHtml ? '<section>' + rHtml + '</section>' : '') +
+    sHtml +
+    (lHtml ? '<section><h2>바로가기</h2>' + lHtml + '</section>' : '') +
+    '<footer><a class="reload" href="' + esc_(selfUrl) + '" target="_top">↻ 최신 내용으로 새로고침</a></footer></div>';
+  return { title: info.name, css: css, body: body, js: jsCode, updated: td + ' ' + nowHm };
+}
+
+/* ================= 시트·텔레그램 공통 ================= */
+
+function sheet_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sh) throw new Error("'" + SHEET_NAME + "' 탭을 찾을 수 없어요.");
+  return sh;
+}
+
+let SETTINGS_CACHE_ = null; // 한 번 실행하는 동안 '설정' 탭은 한 번만 읽음
+
+function getSetting_(label) {
+  if (!SETTINGS_CACHE_) {
+    SETTINGS_CACHE_ = {};
+    const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SETTINGS_NAME);
+    if (sh) {
+      sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 2).getDisplayValues().forEach(function (r) {
+        const k = String(r[0]).trim();
+        if (k && !(k in SETTINGS_CACHE_)) SETTINGS_CACHE_[k] = String(r[1]).trim();
+      });
+    }
+  }
+  return SETTINGS_CACHE_[label] || '';
+}
+
+function summaryMode_() {
+  const v = getSetting_('아침 요약 요일');
+  return v === '평일' || v === '끔' ? v : '매일';
+}
+
+function tg_(method, payload) {
+  const token = PropertiesService.getScriptProperties().getProperty('BOT_TOKEN');
+  const url = 'https://api.telegram.org/bot' + token + '/' + method;
+  let lastErr = null;
+  // 구글 쪽 일시 오류("사용할 수 없는 주소" 등)가 가끔 나서 최대 3번까지 다시 시도
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = UrlFetchApp.fetch(url, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      });
+      const code = res.getResponseCode();
+      if (code >= 500 || code === 429) throw new Error('텔레그램 응답 ' + code);
+      try { return JSON.parse(res.getContentText()); } catch (e) { return null; }
+    } catch (e) {
+      lastErr = e;
+      Utilities.sleep(1500 * (i + 1));
+    }
+  }
+  // 오류 문구에 봇 토큰이 섞여 나가지 않게 가림
+  const msg = String((lastErr && lastErr.message) || lastErr || '알 수 없는 오류').split(token || '\u0000').join('***');
+  throw new Error('텔레그램 연결 실패: ' + msg.replace(/bot\d+:[\w-]+/g, 'bot***'));
+}
+
+/* ---- 텔레그램이 계속 안 될 때 대비 ----
+ * 보내기에 실패한 알림은 버리지 않고 모아 두었다가,
+ *  - 30분 넘게 계속 실패하면 구글 메일로 모아 보냄 (한 번만)
+ *  - 연결이 돌아오면 텔레그램으로 "늦게 도착" 표시와 함께 다시 보냄
+ */
+const OUTAGE_MAIL_MIN = 30;
+const PENDING_MAX = 20;
+let OUTAGE_THIS_RUN_ = false;
+
+function send_(text) {
+  const props = PropertiesService.getScriptProperties();
+  const chatId = props.getProperty('CHAT_ID');
+  if (!chatId) throw new Error('아직 텔레그램 대화가 연결되지 않았어요. 봇에게 /start 를 먼저 보내 주세요.');
+  // 이번 실행에서 이미 실패했으면 또 기다리지 않고 바로 대기열에 넣음
+  if (OUTAGE_THIS_RUN_) { queuePending_(props, text); return; }
+  try {
+    safeSend_(chatId, text);
+  } catch (e) {
+    OUTAGE_THIS_RUN_ = true;
+    queuePending_(props, text);
+    noteOutage_(props, e.message);
+    return; // 알림 확인 작업은 계속 진행 (보냈다고 기록하되, 내용은 대기열에 남아 있음)
+  }
+  if (props.getProperty('TG_FAIL_SINCE')) recoverOutage_(props, chatId);
+}
+
+function safeSend_(chatId, text) {
+  const res = tg_('sendMessage', { chat_id: chatId, text: String(text).slice(0, 4000), disable_web_page_preview: true });
+  if (!res || !res.ok) {
+    throw new Error('텔레그램 연결 실패: ' + ((res && res.description) || '응답 없음'));
+  }
+  return res;
+}
+
+function queuePending_(props, text) {
+  let list = [];
+  try { list = JSON.parse(props.getProperty('TG_PENDING') || '[]'); } catch (e) { list = []; }
+  list.push({ at: Utilities.formatDate(new Date(), TZ, 'M/d HH:mm'), text: String(text).slice(0, 600) });
+  if (list.length > PENDING_MAX) list = list.slice(list.length - PENDING_MAX);
+  props.setProperty('TG_PENDING', JSON.stringify(list));
+}
+
+function noteOutage_(props, why) {
+  const now = Date.now();
+  let since = Number(props.getProperty('TG_FAIL_SINCE') || 0);
+  if (!since) { since = now; props.setProperty('TG_FAIL_SINCE', String(now)); }
+  props.setProperty('TG_FAIL_WHY', String(why || '').slice(0, 300));
+  if (props.getProperty('TG_FAIL_MAILED') || now - since < OUTAGE_MAIL_MIN * 60000) return;
+  try {
+    let list = [];
+    try { list = JSON.parse(props.getProperty('TG_PENDING') || '[]'); } catch (e) {}
+    const body = [
+      '리마인더 봇이 ' + Math.round((now - since) / 60000) + '분째 텔레그램으로 알림을 보내지 못하고 있어요.',
+      '마지막 오류: ' + (why || '-'),
+      '',
+      '그동안 보내지 못한 알림 (' + list.length + '개):',
+      ''
+    ].concat(list.map(function (p) { return '[' + p.at + '] ' + p.text + '\n'; })).concat([
+      '',
+      '연결이 돌아오면 텔레그램으로도 다시 보내 드려요.',
+      '계속 이러면 Apps Script 편집기에서 testSend 를 실행해 보거나, BotFather에서 토큰이 바뀌지 않았는지 확인해 주세요.'
+    ]).join('\n');
+    MailApp.sendEmail(Session.getEffectiveUser().getEmail(), '[리마인더 봇] 텔레그램 알림이 안 가고 있어요', body);
+    props.setProperty('TG_FAIL_MAILED', String(now));
+  } catch (e) {
+    console.warn('메일 보내기도 실패: ' + e.message);
+  }
+}
+
+function recoverOutage_(props, chatId) {
+  const since = Number(props.getProperty('TG_FAIL_SINCE') || 0);
+  let list = [];
+  try { list = JSON.parse(props.getProperty('TG_PENDING') || '[]'); } catch (e) {}
+  ['TG_FAIL_SINCE', 'TG_FAIL_MAILED', 'TG_FAIL_WHY', 'TG_PENDING'].forEach(function (k) { props.deleteProperty(k); });
+  const mins = since ? Math.round((Date.now() - since) / 60000) : 0;
+  if (!list.length && mins < 10) return; // 잠깐 끊겼다 바로 돌아온 경우는 조용히 넘어감
+  try {
+    safeSend_(chatId, '🔧 텔레그램 연결이 약 ' + mins + '분 동안 끊겼다가 돌아왔어요.' +
+      (list.length ? ' 그동안 못 보낸 알림 ' + list.length + '개를 이어서 보낼게요.' : ''));
+    list.forEach(function (p) { safeSend_(chatId, '⏳ 늦게 도착 (' + p.at + ')\n' + p.text); });
+  } catch (e) {
+    // 복구 직후 다시 끊기면 대기열을 되돌려 놓음
+    list.forEach(function (p) { queuePending_(props, p.text); });
+    noteOutage_(props, e.message);
+  }
+}
+
+/** 편집기에서 실행: 텔레그램이 안 될 때 메일이 제대로 오는지 시험 */
+function testOutageMail() {
+  MailApp.sendEmail(Session.getEffectiveUser().getEmail(), '[리마인더 봇] 메일 알림 시험', '텔레그램이 30분 넘게 안 되면 이 주소로 알림을 모아 보내 드려요.');
+}
